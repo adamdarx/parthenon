@@ -50,6 +50,15 @@ using namespace loops;
 using namespace loops::shorthands;
 
 namespace {
+int DenseComponentTeamCount(const int components) {
+  // More concurrent teams help mapped host-buffer accesses. Device buffers
+  // instead favor Parthenon's native granularity in the matched AMR benchmark.
+#ifdef PARTHENON_ENABLE_HOST_COMM_BUFFERS
+  return components;
+#else
+  return 1;
+#endif
+}
 int GetNteamsPerBoundaryBuffer(const Mesh *pmesh, const int nbound) {
   PARTHENON_REQUIRE_THROWS(
       nbound > 0,
@@ -116,7 +125,17 @@ TaskStatus SendBoundBufsWithRestrictOption(std::shared_ptr<MeshData<Real>> &md,
   // Load buffer data
   auto &bnd_info = cache.bnd_info;
   PARTHENON_DEBUG_REQUIRE(bnd_info.size() == nbound, "Need same size for boundary info");
-  const int nteams_per_buffer = GetNteamsPerBoundaryBuffer(pmesh, nbound);
+  // For dense fields, expose component-level parallelism instead of assigning
+  // all components of a boundary to one team. The existing range splitter
+  // preserves exact coverage for different shapes and refinement levels.
+  const auto &first_var = cache.bnd_info_h(0).var;
+  const int component_teams = Globals::sparse_config.enabled
+                                  ? 1
+                                  : first_var.GetDim(4) * first_var.GetDim(5) *
+                                        first_var.GetDim(6);
+  const int nteams_per_buffer =
+      std::max(GetNteamsPerBoundaryBuffer(pmesh, nbound),
+               DenseComponentTeamCount(component_teams));
   const int work_chunk_size = pmesh->boundary_buffer_work_chunk_size;
   const bool check_sparse = Globals::sparse_config.enabled;
   auto &sending_nonzero_flags = cache.sending_non_zero_flags;
@@ -203,7 +222,9 @@ TaskStatus SendBoundBufsWithRestrictOption(std::shared_ptr<MeshData<Real>> &md,
     Kokkos::deep_copy(sending_nonzero_flags_h, sending_nonzero_flags);
   const bool coal_comm = pmesh->do_coalesced_comms;
 #ifdef MPI_PARALLEL
-  if (!coal_comm) Kokkos::fence();
+  // A one-rank MPI build has the same device-stream ordering as a
+  // non-MPI build: local buffers are not handed to an MPI transport.
+  if (!coal_comm && Globals::nranks > 1) Kokkos::fence();
 #endif
   for (std::size_t ibuf = 0; ibuf < cache.buf_vec.size(); ++ibuf) {
     auto &buf = *cache.buf_vec[ibuf];
@@ -354,7 +375,14 @@ TaskStatus SetBounds(std::shared_ptr<MeshData<Real>> &md) {
   }
   // const Real threshold = Globals::sparse_config.allocation_threshold;
   auto &bnd_info = cache.bnd_info;
-  const int nteams_per_buffer = GetNteamsPerBoundaryBuffer(pmesh, nbound);
+  const auto &first_var = cache.bnd_info_h(0).var;
+  const int component_teams = Globals::sparse_config.enabled
+                                  ? 1
+                                  : first_var.GetDim(4) * first_var.GetDim(5) *
+                                        first_var.GetDim(6);
+  const int nteams_per_buffer =
+      std::max(GetNteamsPerBoundaryBuffer(pmesh, nbound),
+               DenseComponentTeamCount(component_teams));
   const int work_chunk_size = pmesh->boundary_buffer_work_chunk_size;
 
   Kokkos::parallel_for(
@@ -419,7 +447,7 @@ TaskStatus SetBounds(std::shared_ptr<MeshData<Real>> &md) {
         }
       });
 #ifdef MPI_PARALLEL
-  Kokkos::fence();
+  if (Globals::nranks > 1) Kokkos::fence();
 #endif
   std::for_each(std::begin(cache.buf_vec), std::end(cache.buf_vec),
                 [](auto pbuf) { pbuf->Stale(); });
